@@ -1,0 +1,259 @@
+# Diseño de la Topologia de la Aplicación
+
+## Introducción General
+
+El presente documento describe la arquitectura técnica de la solución desplegada sobre infraestructura AWS, utilizando exclusivamente instancias EC2 como unidad de cómputo. La decisión de no incorporar servicios gestionados adicionales de AWS responde a un criterio de control total sobre el stack de software, permitiendo replicar el entorno en cualquier proveedor de infraestructura sin dependencia de APIs propietarias. La orquestación de contenedores se implementa mediante Kubernetes auto-gestionado (self-managed), el plano de red de pods se resuelve con Calico como plugin CNI, el enrutamiento de tráfico externo se delega a Ingress NGINX y la terminación TLS se automatiza con cert-manager y Let’s Encrypt.
+
+***
+
+## 1. Diagrama de Red
+
+### Introducción
+
+La capa de red constituye el fundamento sobre el que opera el resto de la solución. Se tomó la decisión de segmentar la infraestructura en una Virtual Private Cloud (VPC) con dos subredes de distinta naturaleza — una pública y una privada — para establecer un perímetro de seguridad que impida el acceso directo desde Internet a los componentes internos del clúster. Esta separación responde al principio de defensa en profundidad: únicamente el nodo de entrada público, que ejecuta Ingress NGINX y dispone de Elastic IP, es visible desde la red pública; los nodos de control y cómputo internos permanecen segmentados según su rol y las reglas de seguridad definidas. 
+
+<div align="center">
+  <img src="../../media/Diagrama Completo Red (V1.0.0).jpg" alt="Diagrama de estructura de solucion de red" />
+</div>
+
+***
+
+### 1.1 Topología General de la VPC
+
+La VPC agrupa todos los recursos del proyecto bajo un espacio de red lógico aislado dentro de la región AWS seleccionada. Todo el tráfico entrante desde Internet debe atravesar un Internet Gateway antes de alcanzar cualquier recurso dentro de la VPC. Este Internet Gateway es el único punto de entrada y salida de tráfico externo a nivel de la VPC.
+
+Dentro de la VPC, un segundo firewall interno implementado mediante Security Groups de AWS aplicados a nivel de instancia controla el tráfico entre la subred pública y la subred privada, así como el tráfico lateral entre las instancias de la subred privada. Además, la solución introduce una capa de red overlay para pods mediante Calico, lo que permite conectividad pod-a-pod sin depender de rutas nativas de la VPC para cada CIDR de Kubernetes.
+
+### 1.2 Subredes
+
+#### 1.2.1 Red Frontend — Subred Pública
+
+Esta subred aloja el nodo que recibe el tráfico externo de la plataforma. En la arquitectura actual, el acceso público no se concentra en un proxy Docker externo, sino en un Ingress NGINX Controller desplegado dentro de Kubernetes y expuesto mediante una IP pública asociada al nodo submaster. Esta decisión reduce complejidad operativa, elimina una capa intermedia de red y permite que el tráfico HTTP/HTTPS entre directamente al plano de entrada del clúster.
+
+La subred pública tiene asociada una tabla de enrutamiento que incluye una ruta por defecto hacia el Internet Gateway de la VPC. Esto permite que las instancias ubicadas en esta subred reciban tráfico originado en Internet, siempre que las reglas del Security Group de la instancia lo permitan.
+
+**Instancia residente:** EC2 submaster con Elastic IP y Ingress NGINX Controller.
+
+#### 1.2.2 Red Backend — Subred Privada
+
+**Por qué se decidió este segmento:** Esta subred aloja el nodo control plane, los nodos worker y, cuando aplica, la instancia de base de datos. La decisión de aislar estos componentes en una subred privada obedece a que ninguno de ellos debe ser accesible desde Internet de forma directa. El tráfico que llega a los servicios internos proviene exclusivamente del Ingress Controller o de los componentes internos del clúster. Esta segmentación elimina la superficie de ataque externa sobre los componentes más críticos del sistema.
+
+La subred privada tiene una tabla de enrutamiento que no incluye ruta hacia el Internet Gateway. Cualquier tráfico saliente desde esta subred que requiera alcanzar Internet debería ser enrutado a través de un NAT Gateway; sin embargo, dicho componente queda fuera del alcance del diseño actual.
+
+**Instancias residentes:** EC2 Master, EC2 Worker, EC2 Worker 2, EC2 DDBB.
+
+### 1.3 Flujo de Datos y Puertos
+
+La siguiente tabla describe cada segmento del flujo de tráfico, el protocolo, el puerto, el origen y el destino de cada trama.
+
+| Segmento | Protocolo | Puerto | Origen | Destino | Descripción |
+|---|---|---|---|---|---|
+| Acceso externo | TCP | 443 | Clientes (Internet) | Elastic IP del nodo submaster | Solicitud HTTPS iniciada por el cliente |
+| Acceso externo HTTP | TCP | 80 | Clientes (Internet) | Elastic IP del nodo submaster | Solicitud HTTP para redirección y challenge ACME HTTP-01 |
+| Ingreso a clúster | TCP | 443 | Internet Gateway | EC2 submaster (Ingress NGINX) | Tráfico admitido tras filtrado perimetral |
+| Ingreso a clúster HTTP | TCP | 80 | Internet Gateway | EC2 submaster (Ingress NGINX) | Tráfico admitido para redirección a HTTPS o validación ACME |
+| Ingress → Services/Pods | TCP | 80 | EC2 submaster (Ingress NGINX) | Services de Kubernetes / Pods | Distribución de carga de trabajo HTTP dentro del clúster |
+| Ingress → TLS | TCP | 443 | EC2 submaster (Ingress NGINX) | Services de Kubernetes / Pods | Terminación TLS en Ingress y reenvío interno al backend |
+| API Server → Kubelet | TCP | 10250 | Kubernetes API Server (EC2 Master) | EC2 Worker / EC2 Worker 2 (Kubelet API) | Instrucciones de orquestación del Control Plane |
+| Calico BGP | TCP | 179 | EC2 Master / EC2 submaster / Workers | Nodos Calico peers | Establecimiento de sesiones BGP entre nodos |
+| Pods → Base de datos | TCP | 3306 | Pods en Workers | EC2 DDBB (MySQL/MariaDB) | Consultas SQL desde los contenedores de aplicación |
+
+#### Descripción detallada del flujo por segmento:
+
+**Segmento 1 — Cliente a Ingress público (Puerto 443/TCP):** El cliente inicia una conexión TCP con destino al puerto 443 del endpoint público de la infraestructura. El handshake TLS se negocia en este punto. El tráfico llega a la Elastic IP del nodo submaster, donde reside el Ingress NGINX Controller.
+
+**Segmento 2 — Cliente a Ingress HTTP (Puerto 80/TCP):** El puerto 80 se mantiene activo para permitir dos funciones esenciales: la redirección automática de HTTP a HTTPS y la validación de certificados mediante ACME HTTP-01. Este puerto debe permanecer accesible desde Internet para que cert-manager pueda completar el challenge de Let’s Encrypt.
+
+**Segmento 3 — Internet Gateway a EC2 submaster (Puertos 80/443 TCP):** El Internet Gateway de la VPC recibe la trama y la enruta hacia la instancia EC2 submaster ubicada en la subred pública, de acuerdo con la tabla de enrutamiento asociada. El Security Group del submaster debe tener habilitadas reglas de entrada que permitan TCP/80 y TCP/443 desde cualquier origen, ya que el Ingress Controller es el punto de exposición pública del sistema.
+
+**Segmento 4 — Ingress NGINX a Services y Pods (Puertos 80/443 TCP):** Ingress NGINX termina TLS y reenvía el tráfico hacia los Services de Kubernetes. La decisión de routing se realiza mediante las reglas Ingress definidas por host y path, y la distribución hacia los pods backend se ejecuta mediante la red interna del clúster. Esta capa sustituye por completo el proxy Docker externo presente en la arquitectura anterior.
+
+**Segmento 5 — API Server a Kubelet (Puerto 10250/TCP):** El Kubernetes API Server se comunica con el agente Kubelet de cada nodo Worker a través del puerto 10250/TCP. Este canal es utilizado por el Control Plane para enviar instrucciones de gestión de pods (creación, actualización, eliminación, inspección de logs y ejecución de comandos en contenedores).
+
+**Segmento 6 — Calico BGP entre nodos (Puerto 179/TCP):** Calico utiliza sesiones BGP para intercambiar rutas entre nodos y mantener la conectividad pod-a-pod. En AWS este puerto debe abrirse en las reglas de los Security Groups entre todos los nodos del clúster; de lo contrario, los nodos no establecerán vecindades BGP y la red de pods quedará incompleta.
+
+**Segmento 7 — Pods a Base de Datos (Puerto 3306/TCP):** Los contenedores en ejecución dentro de los nodos Worker realizan consultas SQL hacia la instancia de base de datos a través del puerto 3306/TCP, que es el puerto estándar del motor MySQL/MariaDB. El Security Group de la base de datos debe permitir este tráfico exclusivamente desde los rangos de los nodos Worker o del Security Group del clúster, rechazando cualquier otro origen.
+
+***
+
+### 1.4 Instancias EC2
+
+#### 1.4.1 EC2 Master — Nodo de Control
+
+El nodo Master concentra las funciones críticas del plano de control de Kubernetes. La concentración del Control Plane en un único nodo simplifica la configuración inicial y mantiene el entorno alineado con un despliegue self-managed. En esta arquitectura, el Master no actúa como entrada pública de la aplicación, ya que ese rol se traslada al nodo submaster con Ingress NGINX.
+
+- **Ubicación:** Subred privada
+- **Rol en Kubernetes:** Control Plane (Master Node)
+- **Software residente:** Kubernetes API Server (puerto 6443/TCP), ETCD (puertos 2379-2380/TCP), kube-scheduler (puerto 10259/TCP), cloud-controller-manager (puerto 10257/TCP)
+- **Puertos de entrada requeridos (Security Group):** TCP 6443, TCP 2379-2380, TCP 10257, TCP 10259, TCP 10250 desde nodos autorizados
+
+#### 1.4.2 EC2 submaster — Nodo de Entrada e Ingress
+
+El nodo submaster asume el rol de punto de entrada público del clúster. La decisión de ubicar aquí el Ingress NGINX Controller responde al requisito de exponer únicamente una capa controlada de acceso, manteniendo separados el plano de control y el plano de entrada HTTP/HTTPS. La Elastic IP del submaster permite que el DNS del dominio apunte de forma estable a la dirección pública del Ingress.
+
+- **Ubicación:** Subred pública
+- **Rol en Kubernetes:** Worker Node / Ingress Node
+- **Software residente:** Ingress NGINX Controller, kubelet, kube-proxy, Container Runtime
+- **Puertos de entrada requeridos (Security Group):** TCP 80, TCP 443, TCP 10250, TCP 179
+
+#### 1.4.3 EC2 Worker y EC2 Worker 2 — Nodos de Carga de Trabajo
+
+La decisión de desplegar dos Workers independientes permite la distribución de carga entre pods y proporciona tolerancia a fallos básica: si un Worker queda inoperativo, el Scheduler de Kubernetes puede reprogramar los pods en el Worker restante. Ambas instancias son funcionalmente idénticas en configuración de software.
+
+- **Ubicación:** Subred privada
+- **Rol en Kubernetes:** Worker Node
+- **Software residente:** Kubelet (puerto 10250/TCP), kube-proxy, Container Runtime, Calico node
+- **Puertos de entrada requeridos (Security Group):** TCP 10250, TCP 179, rangos necesarios para comunicación interna del clúster
+
+#### 1.4.4 EC2 DDBB — Nodo de Persistencia
+
+Se dedica una instancia EC2 exclusivamente al motor de base de datos para aislar las operaciones de I/O de disco intensivas de la carga de cómputo de los Workers. El estado de la base de datos reside en un volumen EBS adjunto a la instancia, garantizando persistencia independientemente del estado de los pods de aplicación.
+
+- **Ubicación:** Subred privada
+- **Rol en la arquitectura:** Capa de persistencia de datos
+- **Software residente:** MySQL Server o MariaDB Server (puerto 3306/TCP); los datos se almacenan en un volumen EBS adjunto al EC2
+- **Puertos de entrada requeridos (Security Group):** TCP 3306 exclusivamente desde los nodos Worker o desde el Security Group autorizado del clúster
+
+***
+
+## 2. Diagrama de Orquestación y Procesos (Kubernetes)
+
+### Introducción
+
+Kubernetes opera como el sistema de orquestación de contenedores de la solución. La decisión de implementar Kubernetes auto-gestionado sobre instancias EC2, en lugar de Amazon EKS, responde al requisito de no depender de servicios gestionados de AWS. Todo el software de orquestación, scheduling, gestión de estado y enrutamiento de red es instalado y operado directamente sobre las instancias EC2. En esta versión, el plano de red de pods está soportado por Calico y el plano de exposición externa por Ingress NGINX, mientras que cert-manager automatiza el ciclo de vida de TLS.
+
+<div align="center">
+  <img src="../../media/Diagrama Completo K8S (V1.0.0).jpg" alt="Diagrama de funcionamiento de orquestacion y procesos" />
+</div>
+
+***
+
+### 2.1 Control Plane — EC2 Master
+
+El **Control Plane** es el componente que mantiene el estado deseado del clúster. Todos sus subcomponentes se despliegan en el EC2 Master porque requieren comunicación de baja latencia entre sí y acceso exclusivo a ETCD. La concentración del Control Plane en un único nodo Master simplifica la configuración inicial.
+
+#### 2.1.1 Kubernetes API Server
+
+El API Server es el punto de entrada único para todas las operaciones de administración del clúster. Expone una API RESTful sobre el puerto 6443/TCP. Cualquier entidad que interactúe con el clúster — el Developer mediante kubectl, los nodos Worker a través de Kubelet, el Scheduler, el Controller Manager — lo hace exclusivamente a través del API Server. Ningún componente de Kubernetes se comunica directamente con ETCD excepto el propio API Server.
+
+El API Server valida y autentica cada solicitud entrante, aplica políticas de control de acceso basado en roles (RBAC), serializa el estado en ETCD y notifica a los componentes suscritos sobre cambios de estado mediante un mecanismo de watch sobre la API RESTful. 
+
+#### 2.1.2 ETCD — Almacén de Estado del Clúster
+
+ETCD es una base de datos clave-valor distribuida y consistente que almacena la totalidad del estado del clúster de Kubernetes: definiciones de pods, servicios, configmaps, secrets, roles, nodos registrados y cualquier otro objeto de la API. Opera en el puerto 2379/TCP para comunicación con clientes (exclusivamente el API Server) y en el puerto 2380/TCP para comunicación entre peers en configuraciones de clúster ETCD multi-nodo.
+
+En esta arquitectura, ETCD se ejecuta como proceso único en el EC2 Master (embedded etcd). Cualquier pérdida del EC2 Master sin respaldo previo del datadir de ETCD implica la pérdida del estado completo del clúster, razón por la cual se recomienda implementar snapshots periódicos. 
+
+#### 2.1.3 Scheduler (kube-scheduler)
+
+El Scheduler es el componente responsable de asignar pods sin nodo asignado (estado `Pending`) a un nodo Worker disponible. Para ello, el Scheduler consulta al API Server los pods en estado `Pending`, evalúa los recursos disponibles en cada nodo Worker (CPU, memoria, restricciones de afinidad, taints/tolerations) y escribe la decisión de asignación (binding) de vuelta en el API Server. Opera en el puerto 10259/TCP para su interfaz de salud y métricas.
+
+El Scheduler no se comunica directamente con los Workers; únicamente escribe la decisión de binding en el API Server, y es el Kubelet del nodo seleccionado quien detecta el binding y materializa el pod.
+
+#### 2.1.4 Cloud Controller Manager (c-c-m)
+
+El Cloud Controller Manager abstrae la interacción entre Kubernetes y la infraestructura de nube subyacente. En esta arquitectura, opera sobre instancias EC2 de AWS pero sin consumir servicios gestionados adicionales. Su función se limita a la reconciliación del estado de los nodos y a la integración lógica con la nube donde resulta necesario, manteniendo el principio de independencia del stack. Opera en el puerto 10257/TCP.
+
+***
+
+### 2.2 Worker Node — EC2 submaster / EC2 Worker / EC2 Worker 2
+
+Los Worker Nodes son las unidades de ejecución de los pods de aplicación. Cada nodo ejecuta tres componentes de sistema: Kubelet, kube-proxy y el Container Runtime. En los nodos que participan en el tránsito de red del clúster también se ejecuta Calico node, que programa la conectividad de pods y mantiene las sesiones BGP con sus pares.
+
+#### 2.2.1 Kubelet
+
+El Kubelet es el agente principal de Kubernetes en cada nodo Worker. Es un proceso de sistema (daemon) que se ejecuta directamente en el sistema operativo del EC2, fuera de cualquier contenedor. El Kubelet expone su API en el puerto 10250/TCP, a través del cual el Kubernetes API Server del EC2 Master envía instrucciones de gestión.
+
+Las responsabilidades del Kubelet incluyen: registrar el nodo en el API Server al inicio, monitorear continuamente los pods asignados al nodo, invocar al Container Runtime para crear, iniciar, detener y eliminar contenedores, montar los volúmenes declarados en las especificaciones de pod, y reportar periódicamente el estado de salud del nodo y de cada pod al API Server.
+
+#### 2.2.2 kube-proxy
+
+El kube-proxy opera en cada nodo Worker y programa reglas de enrutamiento en el kernel del sistema operativo (mediante iptables o IPVS) para implementar la abstracción de red de los Services de Kubernetes. Cuando un Service de Kubernetes es creado o actualizado, el API Server notifica al kube-proxy, que actualiza las reglas del nodo para que cualquier trama destinada a la ClusterIP del Service sea redirigida hacia la IP real de uno de los pods que respaldan ese Service.
+
+En el contexto del diagrama, kube-proxy actúa como mecanismo de forwarding interno entre el Service y los pods backend, mientras que Ingress NGINX se encarga del punto de entrada HTTP/HTTPS desde Internet. Esta separación evita mezclar exposición pública con balanceo interno del clúster. 
+
+#### 2.2.3 Container Runtime
+
+El Container Runtime es el software que materializa la ejecución de los contenedores definidos en los pods. En cada nodo Worker, el Container Runtime recibe instrucciones del Kubelet a través de la interfaz CRI (Container Runtime Interface) y es responsable de descargar las imágenes de contenedor, crear los namespaces de Linux, configurar los cgroups para limitar recursos y arrancar el proceso principal del contenedor. 
+
+#### 2.2.4 Calico Node
+
+Calico Node proporciona la conectividad de red de pod a pod y de pod a service sin necesidad de rutas estáticas manuales para cada subred de pods. En la arquitectura actual, Calico utiliza BGP para anunciar rutas entre nodos y, en AWS, el modo CrossSubnet con encapsulación IP-in-IP cuando el tráfico cruza subredes distintas, optimizando el rendimiento dentro de una misma subred y preservando la conectividad entre dominios de red separados.
+
+Calico requiere que el puerto TCP 179 esté disponible entre nodos para establecer vecindades BGP. Además, en entornos AWS con MTU alta, la configuración de MTU debe ajustarse correctamente para evitar fragmentación y pérdidas intermitentes de conectividad.
+
+***
+
+### 2.3 Flujo de Orquestación — Ciclo de Vida de un Pod
+
+La descripción del flujo de orquestación es necesaria para identificar cada componente involucrado en la transición de una instrucción del Developer a la ejecución efectiva de un contenedor en un Worker Node, incluyendo el protocolo y puerto de comunicación en cada paso.
+
+1. El Developer ejecuta `kubectl apply -f deployment.yaml`. kubectl envía una solicitud HTTP PUT/POST al Kubernetes API Server en el puerto 6443/TCP del EC2 Master.
+2. El API Server autentica y autoriza la solicitud, valida el objeto de la API y persiste el estado deseado en ETCD a través del puerto 2379/TCP.
+3. El Scheduler detecta, mediante un watch sobre el API Server, que existen pods en estado `Pending` sin nodo asignado. Evalúa los Workers disponibles y escribe la decisión de binding en el API Server. 
+4. El Kubelet del Worker seleccionado detecta el binding mediante su propio watch sobre el API Server. El Kubelet invoca al Container Runtime para crear y arrancar los contenedores definidos en la especificación del pod. 
+5. El Container Runtime arranca los contenedores. El Kubelet reporta el estado `Running` del pod de vuelta al API Server a través del puerto 10250/TCP. 
+6. Calico programa la conectividad de red necesaria entre nodos y pods, y mantiene el intercambio de rutas mediante BGP sobre TCP/179.
+7. A partir de este punto, el tráfico entrante desde Ingress NGINX en los puertos 80 o 443 es dirigido al Service correspondiente y desde allí al pod de destino, manteniendo la abstracción de red propia de Kubernetes.
+
+***
+
+### 2.4 Rol de AWS en la Arquitectura (Solo EC2)
+
+AWS provee exclusivamente los siguientes elementos de infraestructura en este diseño:
+
+- **Instancias EC2:** Máquinas virtuales sobre el hypervisor Nitro System de AWS que ejecutan el sistema operativo Linux sobre el cual se instalan manualmente todos los componentes de Kubernetes, Calico, Ingress NGINX y cert-manager. 
+
+<div align="center">
+  <img src="../../media/amazon_ec2_logotipo.webp" alt="¿Qué es Amazon EC2?" />
+</div>
+
+- **Virtual Private Cloud (VPC):** Red virtual privada que proporciona aislamiento de red. La VPC, las subredes, las tablas de enrutamiento y el Internet Gateway son configurados manualmente por el operador.
+
+<div align="center">
+  <img src="../../media/fundamentos_aws_vpc.webp" alt="Funcionamiento de Amazon VPC" />
+</div>
+
+- **Security Groups:** Firewall de estado (stateful) operado por AWS a nivel de hipervisor, aplicado a cada interfaz de red de las instancias EC2. Las reglas de los Security Groups definen qué tráfico TCP/UDP puede entrar y salir de cada instancia según el puerto y el origen/destino.
+
+<div align="center">
+  <img src="../../media/grupos_de_seguridad_aws.webp" alt="Funcionamiento de Amazon Security Groups" />
+</div>
+
+- **Internet Gateway:** Componente de la VPC administrado por AWS que permite la comunicación entre la subred pública y el Internet público, sin requerir configuración de software en las instancias EC2. 
+
+<div align="center">
+  <img src="../../media/internet_gateway_aws.webp" alt="Funcionamiento de Amazon Internet Gateway" />
+</div>
+
+- **EBS Volumes:** Volúmenes de almacenamiento en bloque adjuntos a las instancias EC2, utilizados para el almacenamiento persistente del datadir de MySQL/MariaDB y para el almacenamiento asociado al plano de control cuando corresponde.
+
+***
+
+### Webgrafía
+
+- Amazon Web Services. (s.f.). *Create an Amazon VPC for your Amazon EKS cluster*. Amazon EKS User Guide. [https://docs.aws.amazon.com/eks/latest/userguide/creating-a-vpc.html](https://docs.aws.amazon.com/eks/latest/userguide/creating-a-vpc.html) [docs.aws.amazon](https://docs.aws.amazon.com/eks/latest/userguide/creating-a-vpc.html)
+
+- Amazon Web Services. (s.f.). *VPC and subnet considerations*. Amazon EKS Best Practices Guide. [https://docs.aws.amazon.com/eks/latest/best-practices/subnets.html](https://docs.aws.amazon.com/eks/latest/best-practices/subnets.html) [docs.aws.amazon](https://docs.aws.amazon.com/eks/latest/best-practices/subnets.html)
+
+- CloudNative Computing Foundation. (s.f.). *Ingress* y *service networking* en Kubernetes. [https://kubernetes.io/docs/concepts/services-networking/ingress/](https://kubernetes.io/docs/concepts/services-networking/ingress/) [kubernetes](https://kubernetes.io/docs/concepts/services-networking/ingress/)
+
+- CloudNative Computing Foundation. (s.f.). *Ports and protocols*. Kubernetes Documentation. [https://kubernetes.io/docs/reference/networking/ports-and-protocols/](https://kubernetes.io/docs/reference/networking/ports-and-protocols/) [kubernetes](https://kubernetes.io/docs/reference/networking/ports-and-protocols/)
+
+- CloudNative Computing Foundation. (s.f.). *Cluster Networking*. Kubernetes Documentation. [https://kubernetes.io/docs/concepts/cluster-administration/networking/](https://kubernetes.io/docs/concepts/cluster-administration/networking/) [kubernetes](https://kubernetes.io/docs/concepts/cluster-administration/networking/)
+
+- CloudNative Computing Foundation. (s.f.). *kubelet*. Kubernetes Documentation. [https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/](https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/) [kubernetes](https://kubernetes.io/docs/reference/command-line-tools-reference/kubelet/)
+
+- CloudNative Computing Foundation. (s.f.). *Certificate management with cert-manager*. cert-manager Documentation. [https://cert-manager.io/docs/](https://cert-manager.io/docs/) [cert-manager](https://cert-manager.io/docs/)
+
+- CloudNative Computing Foundation. (s.f.). *ACME HTTP01 challenge*. cert-manager Documentation. [https://cert-manager.io/docs/configuration/acme/http01/](https://cert-manager.io/docs/configuration/acme/http01/) [cert-manager](https://cert-manager.io/docs/configuration/acme/http01/)
+
+- Tigera. (s.f.). *Calico networking*. Project Calico Documentation. [https://docs.tigera.io/calico/latest/networking/](https://docs.tigera.io/calico/latest/networking/) [calico](https://docs.tigera.io/calico/latest/networking/)
+
+- Tigera. (s.f.). *BGP routing*. Project Calico Documentation. [https://docs.tigera.io/calico/latest/networking/configuring/bgp](https://docs.tigera.io/calico/latest/networking/configuring/bgp) [calico](https://docs.tigera.io/calico/latest/networking/configuring/bgp)
+
+- Tigera. (s.f.). *MTU considerations for Calico on cloud providers*. Project Calico Documentation. [https://docs.tigera.io/calico/latest/networking/configuring/mtu](https://docs.tigera.io/calico/latest/networking/configuring/mtu) [calico](https://docs.tigera.io/calico/latest/networking/configuring/mtu)
+
+- Let’s Encrypt. (s.f.). *How it works*. Let’s Encrypt Documentation. [https://letsencrypt.org/how-it-works/](https://letsencrypt.org/how-it-works/) [letsencrypt](https://letsencrypt.org/how-it-works/)
+
+Si quieres, en el siguiente paso puedo devolvértelo ya **en formato limpio de documento final**, sin explicación adicional, listo para pegar directamente en tu Markdown.
